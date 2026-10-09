@@ -1,7 +1,9 @@
+import hashlib
 import logging
 import uuid
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -12,11 +14,11 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import decisions, storage, workflow
+from app import decisions, pdf, storage, workflow
 from app.auth import CurrentUser, Principal, require_roles
 from app.config import settings
 from app.db import SessionDep, SessionLocal
@@ -101,10 +103,11 @@ async def extract_and_match(invoice_id: uuid.UUID) -> None:
         invoice = await session.get(Invoice, invoice_id)
         if invoice is None or invoice.file_key is None:
             return
+        text = invoice.pdf_text if pdf.has_usable_text(invoice.pdf_text) else None
         try:
-            pdf = storage.path_for(invoice.file_key).read_bytes()
-            extracted, model = await extract_invoice(pdf)
-        except ExtractionError as exc:
+            data = await storage.get_storage().get(invoice.file_key)
+            extracted, model = await extract_invoice(data, text)
+        except (ExtractionError, storage.StorageError) as exc:
             invoice.extraction_error = str(exc)
             await decisions.record(
                 session,
@@ -122,7 +125,9 @@ async def extract_and_match(invoice_id: uuid.UUID) -> None:
             await session.commit()
             return
 
-        await workflow.apply_extraction(session, invoice, extracted, model)
+        await workflow.apply_extraction(
+            session, invoice, extracted, model, source="pdf text layer" if text else "pdf pages"
+        )
         await workflow.run_match(session, invoice)
         await session.commit()
 
@@ -166,18 +171,56 @@ async def upload_invoice(
     file: UploadFile, principal: Writer, session: SessionDep, background: BackgroundTasks
 ):
     """Upload a PDF. Extraction and matching run in the background; poll the invoice."""
-    data = await file.read(settings.max_upload_bytes + 1)
-    if len(data) > settings.max_upload_bytes:
-        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file_too_large")
-    if not data.startswith(b"%PDF"):
-        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "pdf_required")
 
-    key, sha256 = storage.save(principal.org_id, data)
+    # Safer chunked streaming pattern
+    MAX_BYTES = settings.max_upload_bytes
+    chunks = []
+    total_bytes = 0
+
+    while chunk := await file.read(1024 * 64):  # 64 KB chunks
+        total_bytes += len(chunk)
+        if total_bytes > MAX_BYTES:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file_too_large")
+        chunks.append(chunk)
+
+    data = b"".join(chunks)
+
+    try:
+        content = pdf.read_pdf(data)
+    except pdf.InvalidPdfError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, {"code": "invalid_pdf", "message": str(exc)}
+        ) from exc
+
+    invoice_id = uuid.uuid4()
+    key = storage.invoice_key(principal.org_id, invoice_id)
+    sha256 = hashlib.sha256(data).hexdigest()
+    try:
+        await storage.get_storage().put(
+            key,
+            data,
+            "application/pdf",
+            {"org-id": str(principal.org_id), "invoice-id": str(invoice_id), "sha256": sha256},
+        )
+    except storage.StorageError as exc:
+        log.exception("could not store invoice file for org %s", principal.org_id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "storage_unavailable") from exc
+
     invoice = Invoice(
+        id=invoice_id,
         org_id=principal.org_id,
         file_key=key,
         file_name=Path(file.filename or "invoice.pdf").name[:300],
         file_sha256=sha256,
+        page_count=content.page_count,
+        pdf_text=content.text,
+    )
+    log.info(
+        "stored invoice %s for org %s (%d bytes, %d pages)",
+        invoice_id,
+        principal.org_id,
+        len(data),
+        content.page_count,
     )
     session.add(invoice)
     await session.flush()
@@ -188,7 +231,13 @@ async def upload_invoice(
         actor=Actor.user(principal),
         action="invoice.received",
         summary=f"Uploaded {invoice.file_name}",
-        detail={"file_sha256": sha256, "bytes": len(data)},
+        detail={
+            "file_sha256": sha256,
+            "bytes": len(data),
+            "pages": content.page_count,
+            "text_layer": content.has_text,
+            "storage_key": key,
+        },
     )
     await session.commit()
     background.add_task(extract_and_match, invoice.id)
@@ -205,11 +254,15 @@ async def get_invoice_file(invoice_id: uuid.UUID, principal: CurrentUser, sessio
     invoice = await _get_invoice(session, principal.org_id, invoice_id)
     if not invoice.file_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no_file")
-    return FileResponse(
-        storage.path_for(invoice.file_key),
+    try:
+        data = await storage.get_storage().get(invoice.file_key)
+    except storage.StorageError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "storage_unavailable") from exc
+    name = quote(invoice.file_name or "invoice.pdf")
+    return Response(
+        data,
         media_type="application/pdf",
-        content_disposition_type="inline",
-        filename=invoice.file_name,
+        headers={"content-disposition": f"inline; filename*=UTF-8''{name}"},
     )
 
 

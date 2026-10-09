@@ -35,8 +35,10 @@ Vendor PDF ─▶ AI extraction ─▶ 3-way match ─▶ Approval ─▶ Settle
                                                 reason)
 ```
 
-1. **Received**: an invoice PDF is uploaded and stored with its SHA-256 hash.
-2. **Extracted**: Claude reads it into structured fields: vendor, PO number, lines, totals, terms.
+1. **Received**: the PDF is checked and its text layer read with pypdf, then stored in Cloudflare R2 at
+   `payment-ledger/{org_id}/invoices/{invoice_id}.pdf` with its SHA-256 hash.
+2. **Extracted**: an LLM turns the text into structured fields: vendor, PO number, lines, totals, terms.
+   A free OpenRouter model handles text PDFs; Claude, if configured, also reads scans.
 3. **Matched or exception**: fixed rules (no AI) check vendor, PO, currency, unit price (±2%), quantity
    against goods received minus what's already been billed, totals, duplicates, and the vendor's payout
    wallet. Payments to a wallet changed in the last 72h are held for review. Recording a goods
@@ -59,7 +61,8 @@ The hackathon runs until **Oct 17**. This table shows what works today and what 
 |---|---|
 | Auth: organizations, users, roles, Ed25519 JWT + JWKS, rotating refresh tokens | ✅ Working |
 | Vendors, purchase orders, goods receipts | ✅ Working |
-| Invoice upload + Claude PDF extraction | ✅ Built (needs `ANTHROPIC_API_KEY`; manual entry works without it) |
+| Invoice upload: pypdf text extraction, storage in Cloudflare R2 per org | ✅ Working |
+| LLM field extraction: free OpenRouter models (text PDFs), Claude optional (scans) | ✅ Working (manual entry if no key) |
 | Deterministic 3-way match engine + unit tests | ✅ Working |
 | Approvals with audited overrides | ✅ Working |
 | Double-entry ledger, append-only and balance-checked in Postgres | ✅ Working |
@@ -87,7 +90,7 @@ Requires Docker.
 ```bash
 git clone https://github.com/McDonaldMusimwa/PaymentLedger.git
 cd PaymentLedger
-cp .env.example .env            # optional: add ANTHROPIC_API_KEY to read PDFs with Claude
+cp apps/ledger-api/.env.example apps/ledger-api/.env   # optional: R2 + OpenRouter keys
 docker compose up -d --build --wait
 ```
 
@@ -113,7 +116,7 @@ and the decision log with its hash chain verified.
 |---|---|---|
 | [`apps/web`](apps/web) | React, Vite, Tailwind, TanStack Query | AP inbox, match review, approvals, payments, ledger & audit |
 | [`apps/auth-service`](apps/auth-service) | Node, TypeScript, Fastify | Organizations, users, roles; issues Ed25519 JWTs and publishes `/.well-known/jwks.json` |
-| [`apps/ledger-api`](apps/ledger-api) | Python, FastAPI, SQLAlchemy, Alembic | Invoices, extraction, matching, approvals, ledger, decision log, and the agent (in progress) |
+| [`apps/ledger-api`](apps/ledger-api) | Python, FastAPI, SQLAlchemy, Alembic, pypdf | Invoices, extraction, matching, approvals, ledger, decision log, and the agent (in progress) |
 | [`apps/settlement-service`](apps/settlement-service) | Node, TypeScript | Circle Wallets / App Kit on Arc (in progress) |
 | [`contracts`](contracts) | Solidity, Foundry | `PayablesPolicy` (in progress) |
 | [`infra/postgres`](infra/postgres) | PostgreSQL 16 | Separate `auth_db` and `ledger_db`, each with its own login |
@@ -124,7 +127,8 @@ and the decision log with its hash chain verified.
 
 Key files:
 - [`matching.py`](apps/ledger-api/app/matching.py): the 3-way match rules ([tests](apps/ledger-api/tests/test_matching.py))
-- [`extraction.py`](apps/ledger-api/app/extraction.py): Claude PDF extraction with structured output
+- [`extraction.py`](apps/ledger-api/app/extraction.py): LLM extraction (OpenRouter free models or Claude), validated against a strict schema
+- [`storage.py`](apps/ledger-api/app/storage.py) / [`pdf.py`](apps/ledger-api/app/pdf.py): R2 storage per org, pypdf validation and text
 - [`workflow.py`](apps/ledger-api/app/workflow.py): invoice lifecycle and ledger postings
 - [`decisions.py`](apps/ledger-api/app/decisions.py): hash-chained decision log
 - [`0002_ap_core.py`](apps/ledger-api/alembic/versions/0002_ap_core.py): database triggers that make the ledger append-only and balanced

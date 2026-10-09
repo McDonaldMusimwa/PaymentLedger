@@ -103,7 +103,11 @@ async def resolve_references(session: AsyncSession, invoice: Invoice) -> None:
 
 
 async def apply_extraction(
-    session: AsyncSession, invoice: Invoice, extracted: ExtractedInvoice, model: str
+    session: AsyncSession,
+    invoice: Invoice,
+    extracted: ExtractedInvoice,
+    model: str,
+    source: str = "pdf pages",
 ) -> None:
     invoice.extraction = extracted.model_dump()
     invoice.extraction_error = None
@@ -147,6 +151,7 @@ async def apply_extraction(
             "confidence": extracted.confidence,
             "notes": extracted.notes,
             "is_invoice": extracted.is_invoice,
+            "read_from": source,
             "file_sha256": invoice.file_sha256,
         },
     )

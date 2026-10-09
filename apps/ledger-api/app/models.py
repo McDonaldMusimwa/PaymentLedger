@@ -155,6 +155,9 @@ class Invoice(Base):
     file_key: Mapped[str | None] = mapped_column(String(300))
     file_name: Mapped[str | None] = mapped_column(String(300))
     file_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    # Text layer read by pypdf; empty for scanned PDFs. Kept for search and re-extraction.
+    pdf_text: Mapped[str | None] = mapped_column(Text)
     extraction: Mapped[dict | None] = mapped_column(JSONB)
     extraction_error: Mapped[str | None] = mapped_column(Text)
 
